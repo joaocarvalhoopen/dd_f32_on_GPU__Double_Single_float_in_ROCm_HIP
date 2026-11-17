@@ -1,0 +1,87 @@
+name: GPU Simulator
+
+# Optional check. The hosted runners have no GPU, so this builds the HIP
+# programs for gfx942 and runs them on a simulated AMD Instinct MI300X
+# (https://github.com/pantheongpu/pantheonsim). The test programs only print
+# an accuracy table and exit 0, so the "Check the accuracy" step parses the
+# dd_f32 column and fails below a threshold. That threshold is a CI guard
+# picked from the values observed on a real RX 6800 and on the simulator,
+# not a number from the project. A simulator cannot reproduce hardware
+# timing, so the Perf lines are ignored.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "*.hip"
+      - "*.h"
+      - "Makefile"
+      - ".github/workflows/gpu-sim.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  hip-tests:
+    name: dd_f32 accuracy (simulated MI300X)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up the simulated GPU and ROCm
+        uses: pantheongpu/setup-pantheonsim@a1b9d4237411f9b2b0e0bb895b4d83377f336a7b # v0.1.9
+        with:
+          gpu: amd/mi300x
+          cuda-toolkit: none
+          rocm: "7.1"
+
+      - name: Build
+        run: make -j3 HIPFLAGS="-O3 --offload-arch=gfx942"
+
+      - name: Run test_dd_f32
+        run: |
+          set -o pipefail
+          timeout 3000 vgpu run ./test_dd_f32 | tee small.log
+
+      - name: Run some_complex_calculation
+        run: |
+          set -o pipefail
+          timeout 3000 vgpu run ./some_complex_calculation 100000 8 | tee chain.log
+
+      # The programs exit 0 whatever the accuracy, so parse the dd_f32 column.
+      # Thresholds (bits of relative accuracy) are ours: the observed minimum
+      # is 45 bits (23.5 for sin and cos on that program's input range), so we
+      # require 40 bits (20 for sin and cos). test_dd_f32_full is not run: it
+      # takes over 50 minutes in the simulator.
+      - name: Check the accuracy
+        run: |
+          fail=0
+          if grep -E 'VirtualGPU error|HIP error|no device|[Ss]kipped|\bNaN\b|\bnan\b' small.log chain.log; then
+            echo "Error text found in the output."; fail=1
+          fi
+          grep -q '^GPU: .*MI300X' small.log || { echo "Not running on the simulated MI300X."; fail=1; }
+          bits() { # value or "exact"; prints 0 when missing/unparsable
+            case "$1" in exact) echo 999;; ''|*[!0-9.]*) echo 0;; *) echo "$1";; esac
+          }
+          n=0
+          while read -r op val; do
+            min=40; case "$op" in sin|cos) min=20;; esac
+            v=$(bits "$val"); n=$((n+1))
+            if awk -v v="$v" -v m="$min" 'BEGIN{exit !(v<m)}'; then
+              echo "FAIL small $op dd_f32=$val (< $min)"; fail=1
+            else echo "ok   small $op dd_f32=$val (>= $min)"; fi
+          done < <(sed -n 's/^Accuracy (min rel bits) \([a-z]*\) *|.*dd_f32: *\([0-9.a-z]*\).*/\1 \2/p' small.log)
+          [ "$n" -eq 8 ] || { echo "Expected 8 accuracy lines in small.log, got $n"; fail=1; }
+          grep -q '^Throughput (GEval/s)' chain.log || { echo "No chain result."; fail=1; }
+          exit $fail
